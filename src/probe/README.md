@@ -111,21 +111,28 @@ writes an additional JSON report; automatic reports/logs live in ignored
 `runs/weights/`, and downloads in `.cache/weights/`. `--repo` selects another
 checkout. Nothing updates model cards or the website.
 
-Counts are **logical tensor elements per state dictionary**, including buffers
-and counting shared tensors per name. Model and EMA candidates are separate;
-optimizer state is excluded. These are not trainable or runtime parameter counts:
-parameters created at initialization or inference may be absent from the file.
-`runtime_parameter_count` remains null. Dtype totals describe tensor elements,
-not checkpoint file size or storage compression.
+Counts are **logical tensor elements in model data**. The inspector skips
+optimizer, EMA, scheduler and scaler branches. For serialized modules it follows
+registered parameters and child modules, excluding buffers and cached attributes.
+Plain state dictionaries may mix parameters and buffers; their totals retain that
+limitation. Repeated references to the same tensor count once per candidate;
+different tensor views count separately. Runtime-created parameters may be absent,
+so `runtime_parameter_count` remains null.
 
-Supported inputs are direct HTTP(S) `.pt`, `.pth`, `.bin`, and `.ckpt` files
-containing tensor dictionaries, at the root or under `state_dict`,
-`model_state_dict`, `model`, or `ema`. Extensions are only selection hints.
-The isolated, locked CPU environment uses restricted weights-only loading and
-fake tensors to read shapes without allocating full tensor storage. It never
-imports author code, allowlists custom classes, or retries unrestricted loading.
-TorchScript, serialized model objects, shards, archives, and landing-page
-resolution are unsupported. Unsupported layouts remain explicit in the report.
+Supported inputs are direct HTTP(S) `.pt`, `.pth`, `.bin`, and `.ckpt` files.
+For modern PyTorch ZIP checkpoints, the worker reads only `data.pkl`, replacing
+referenced classes and reducers with inert metadata records. It recognizes tensor
+shapes and never imports model classes, executes their reducers, or reads tensor
+payloads. This includes serialized Ultralytics models. It prefers `state_dict`,
+`model_state_dict` and `model` branches; otherwise it traverses nested model data.
+Multiple primary branches are reported separately rather than added together.
+Unknown tensor encodings and pickle extension opcodes are reported as unsupported.
+
+Legacy non-ZIP files use the locked CPU PyTorch environment with restricted
+weights-only loading and fake tensors; custom serialized legacy models remain
+unsupported. TorchScript, shards, archives, and landing-page resolution are also
+unsupported. Neither path retries unrestricted loading or allowlists author classes.
+Reports identify the inspection method, dtype totals and excluded branches/paths.
 
 Defaults are 2 GiB per download, a 60-second network socket timeout, and a
 300-second inspection-worker timeout (including initial environment setup).

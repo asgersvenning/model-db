@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import shlex
 from pathlib import Path
 import tempfile
 import unittest
@@ -138,8 +139,11 @@ except ImportError:
 
 
 class Untrusted:
+    def __init__(self, marker=None):
+        self.marker = marker
+
     def __reduce__(self):
-        return os.system, ("echo unsafe",)
+        return os.system, ("touch " + shlex.quote(str(self.marker)),)
 
 
 @unittest.skipIf(torch is None, "Run in environments/weights to test the restricted loader")
@@ -159,33 +163,84 @@ class WorkerTests(unittest.TestCase):
         result = self.inspect(self.path)
         self.assertEqual(result['status'], 'ok')
         candidate = result['candidates'][0]
-        self.assertEqual(candidate['tensor_elements'], 14)
-        self.assertEqual(candidate['tensor_count'], 5)
+        self.assertEqual(candidate['tensor_elements'], 8)
+        self.assertEqual(candidate['tensor_count'], 4)
         self.assertEqual(candidate['by_dtype']['torch.int64']['elements'], 1)
         self.assertIsNone(result['runtime_parameter_count'])
 
-    def test_separate_candidates_exclude_optimizer(self):
+    def test_model_excludes_optimizer_and_ema(self):
         torch.save({'model': {'w': torch.zeros(2)}, 'ema': {'w': torch.zeros(3)},
                     'optimizer': {'w': torch.zeros(100)}}, self.path)
         result = self.inspect(self.path)
-        self.assertEqual([(c['container'],c['tensor_elements']) for c in result['candidates']], [('model',2),('ema',3)])
+        self.assertEqual([(c['container'],c['tensor_elements']) for c in result['candidates']], [('model',2)])
+        self.assertEqual(result['excluded_branches'], ['ema', 'optimizer'])
         self.assertEqual(result['status'], 'ok')
         for name in ['state_dict', 'model_state_dict']:
             torch.save({name: {'w': torch.ones(4)}, 'epoch': 12}, self.path)
             self.assertEqual(self.inspect(self.path)['candidates'][0]['tensor_elements'], 4)
 
     def test_partial_and_empty_layouts_are_unresolved(self):
-        for obj in [{}, {'optimizer': {'w': torch.ones(1)}},
-                    {'model': {'w': torch.ones(1)}, 'ema': None},
-                    {'w': torch.ones(1), 'extra': 'metadata'}]:
+        for obj in [{}, {'optimizer': {'w': torch.ones(1)}}, {'ema': {'w': torch.ones(1)}}]:
             torch.save(obj, self.path)
             self.assertEqual(self.inspect(self.path)['status'], 'unresolved')
 
+    def test_serialized_modules_count_parameters_without_loading_classes(self):
+        module = torch.nn.Sequential(torch.nn.Linear(3, 2), torch.nn.BatchNorm1d(2))
+        expected = sum(p.numel() for p in module.parameters())
+        # Tied module references and an unregistered tensor cache must not add
+        # parameters. BatchNorm's explicitly stored buffers are excluded too.
+        module.add_module('alias', module[0])
+        module.cache = torch.ones(100)
+        for protocol in (2, 4, 5):
+            torch.save({'model': module, 'ema': module,
+                        'optimizer': {'state': torch.ones(1000)}}, self.path, pickle_protocol=protocol)
+            with patch.object(torch, 'load') as load:
+                result = self.inspect(self.path)
+                load.assert_not_called()
+            self.assertEqual(result['status'], 'ok', result)
+            self.assertEqual(result['candidates'][0]['tensor_elements'], expected)
+            self.assertTrue(result['candidates'][0]['excluded_paths'])
+
+    def test_nested_state_and_tensor_views(self):
+        tensor = torch.arange(6.)
+        torch.save({'nested': {'weights': [tensor, tensor, tensor[:2]]},
+                    'model_ema': {'weight': torch.ones(100)}, 'epoch': 10}, self.path)
+        result = self.inspect(self.path)
+        self.assertEqual(result['candidates'][0]['tensor_elements'], 8)
+        self.assertEqual(result['candidates'][0]['tensor_count'], 2)
+
+    def test_legacy_state_dictionary(self):
+        torch.save({'state_dict': {'w': torch.ones(4)}, 'ema': {'w': torch.ones(100)}},
+                   self.path, _use_new_zipfile_serialization=False)
+        result = self.inspect(self.path)
+        self.assertEqual(result['method'], 'legacy_restricted_loader')
+        self.assertEqual(result['candidates'][0]['tensor_elements'], 4)
+
     def test_rejects_custom_objects_without_execution(self):
-        torch.save(Untrusted(), self.path)
+        marker = self.path.with_name('must-not-exist')
+        torch.save(Untrusted(marker), self.path)
         with patch('os.system') as execute:
             self.assertEqual(self.inspect(self.path)['status'], 'unresolved')
             execute.assert_not_called()
+        self.assertFalse(marker.exists())
+        torch.save({'model': {'w': torch.ones(2)}, 'metadata': Untrusted(marker)}, self.path)
+        self.assertEqual(self.inspect(self.path)['candidates'][0]['tensor_elements'], 2)
+        self.assertFalse(marker.exists())
+
+    def test_unknown_tensor_encodings_are_not_silently_undercounted(self):
+        sparse = torch.sparse_coo_tensor([[0]], [1.], (3,))
+        torch.save({'model': {'w': torch.ones(2), 'sparse': sparse}}, self.path)
+        self.assertEqual(self.inspect(self.path)['status'], 'unsupported')
+        torch.save({'model': {'w': torch.ones(2)}, 'ema': {'sparse': sparse}}, self.path)
+        result = self.inspect(self.path)
+        self.assertEqual(result['status'], 'ok')
+        self.assertEqual(result['candidates'][0]['tensor_elements'], 2)
+
+    def test_pickle_extension_opcodes_are_rejected(self):
+        import zipfile
+        with zipfile.ZipFile(self.path, 'w') as archive:
+            archive.writestr('archive/data.pkl', b'\x80\x02\x82\x01.')
+        self.assertEqual(self.inspect(self.path)['status'], 'unsupported')
 
     def test_malformed_and_torchscript(self):
         self.path.write_bytes(b'not a checkpoint')

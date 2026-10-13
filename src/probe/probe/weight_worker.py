@@ -6,22 +6,31 @@ import re
 import sys
 import zipfile
 
-VERSION = "1"
-CONTAINERS = ("state_dict", "model_state_dict", "model", "ema")
+VERSION = "2"
+CONTAINERS = ("state_dict", "model_state_dict", "model")
 
 
 def inspect(path):
+    try:
+        from .weight_metadata import Unsupported, inspect_archive
+    except ImportError:  # Executed directly by the coordinator.
+        from weight_metadata import Unsupported, inspect_archive
+
+    if zipfile.is_zipfile(path):
+        result = {"inspection_version": VERSION, "runtime_parameter_count": None,
+                  "candidates": []}
+        try:
+            return dict(result, **inspect_archive(path))
+        except Unsupported as error:
+            return dict(result, status="unsupported", reason=str(error))
+        except Exception as error:
+            return dict(result, status="unresolved", reason=f"{type(error).__name__}: {error}")
+
     import torch
 
     result = {"inspection_version": VERSION, "torch_version": torch.__version__,
+              "method": "legacy_restricted_loader",
               "runtime_parameter_count": None, "candidates": []}
-    # torch.load may dispatch TorchScript archives to torch.jit.load even with
-    # weights_only requested. Reject these before invoking the loader.
-    if zipfile.is_zipfile(path):
-        with zipfile.ZipFile(path) as archive:
-            if any(n.endswith("/constants.pkl") or "/code/" in n
-                   for n in archive.namelist()):
-                return dict(result, status="unsupported", reason="TorchScript archive")
     try:
         from torch._subclasses.fake_tensor import FakeTensorMode
         # Read tensor metadata without allocating checkpoint-sized CPU storage.
@@ -53,13 +62,17 @@ def inspect(path):
         candidates = []
     for name, state in candidates:
         by_dtype = {}
+        seen = set()
         for tensor in state.values():
+            if id(tensor) in seen:
+                continue
+            seen.add(id(tensor))
             dtype = str(tensor.dtype)
             entry = by_dtype.setdefault(dtype, {"tensors": 0, "elements": 0})
             entry["tensors"] += 1
             entry["elements"] += tensor.numel()
         result["candidates"].append({
-            "container": name, "tensor_count": len(state),
+            "container": name, "tensor_count": len(seen),
             "tensor_elements": sum(v["elements"] for v in by_dtype.values()),
             "by_dtype": by_dtype,
         })

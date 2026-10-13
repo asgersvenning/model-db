@@ -12,14 +12,17 @@ import tomllib
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 
 from .runner import digest, execute
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO = ROOT.parents[1]
 EXTENSIONS = {".pt", ".pth", ".bin", ".ckpt"}
-SCOPE = ("Logical elements in each selected state dictionary, including buffers. "
-         "Shared tensors are counted per name. Runtime-created parameters may be absent; "
+SCOPE = ("Logical tensor elements in model data; optimizer and EMA branches are excluded. "
+         "Serialized modules use registered parameters, excluding buffers. Plain state dictionaries "
+         "may include buffers. Repeated references to a tensor count once per candidate; distinct views count separately. "
+         "Runtime-created parameters may be absent; "
          "these are not verified runtime or trainable parameter counts.")
 
 
@@ -128,9 +131,10 @@ def inspect_asset(selected, args, run):
         result.update(info)
         output = run / "result.json"
         worker = ROOT / "probe/weight_worker.py"
+        command = ([sys.executable] if zipfile.is_zipfile(path) else
+                   ["uv", "run", "--locked", "--project", str(ROOT / "environments/weights"), "python"])
         code = execute(
-            ["uv", "run", "--locked", "--project", str(ROOT / "environments/weights"),
-             "python", str(worker), str(path), str(output)],
+            command + [str(worker), str(path), str(output)],
             ROOT, os.environ.copy(), run / "worker.log", args.timeout,
         )
         if code != 0 or not output.is_file():
