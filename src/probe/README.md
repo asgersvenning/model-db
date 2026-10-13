@@ -96,3 +96,51 @@ The [current detection coverage audit](reports/2026-09-30-format-expansion/READM
 includes source-inspected profiles and distinguishes them from runtime evidence.
 BioMoth and Mothbot execute selected original author function bodies from pinned
 sources; their report scope lists omitted notebook/UI and downstream stages.
+
+## Inspect PyTorch weights
+
+List assets without downloads, then inspect a selected file:
+
+```bash
+uv run --locked --project src/probe inspect-weights --model bioclip-2 --list
+uv run --locked --project src/probe inspect-weights --model bioclip-2 --asset weights-pytorch
+```
+
+Use repeated `--model` selectors or explicit `--all`. `--output report.json`
+writes an additional JSON report; automatic reports/logs live in ignored
+`runs/weights/`, and downloads in `.cache/weights/`. `--repo` selects another
+checkout. Nothing updates model cards or the website.
+
+Counts are **logical tensor elements per state dictionary**, including buffers
+and counting shared tensors per name. Model and EMA candidates are separate;
+optimizer state is excluded. These are not trainable or runtime parameter counts:
+parameters created at initialization or inference may be absent from the file.
+`runtime_parameter_count` remains null. Dtype totals describe tensor elements,
+not checkpoint file size or storage compression.
+
+Supported inputs are direct HTTP(S) `.pt`, `.pth`, `.bin`, and `.ckpt` files
+containing tensor dictionaries, at the root or under `state_dict`,
+`model_state_dict`, `model`, or `ema`. Extensions are only selection hints.
+The isolated, locked CPU environment uses restricted weights-only loading and
+fake tensors to read shapes without allocating full tensor storage. It never
+imports author code, allowlists custom classes, or retries unrestricted loading.
+TorchScript, serialized model objects, shards, archives, and landing-page
+resolution are unsupported. Unsupported layouts remain explicit in the report.
+
+Defaults are 2 GiB per download, a 60-second network socket timeout, and a
+300-second inspection-worker timeout (including initial environment setup).
+Override with `--max-bytes`, `--network-timeout`, and `--timeout`.
+Checksums are verified when supplied. Only checksum-pinned or immutable Hub
+URLs reuse verified cache entries; mutable URLs are fetched again.
+
+Failures do not stop other assets. Non-PyTorch/unsupported links are listed and
+skipped; unsuccessful inspections of eligible PyTorch files return a nonzero
+exit status. Counts missing due to failure are never zero. `--list` exits zero
+for a valid selection regardless of eligibility.
+
+Run offline fixture tests, including restricted-loader checks:
+
+```bash
+PYTHONPATH=src/probe uv run --locked --project src/probe/environments/weights \
+  python -m unittest discover -s src/probe/tests -v
+```

@@ -6,6 +6,7 @@ dependencies = []
 
 [project.scripts]
 probe-models = "probe.runner:main"
+inspect-weights = "probe.weights:main"
 
 [build-system]
 requires = ["hatchling==1.27.0"]
